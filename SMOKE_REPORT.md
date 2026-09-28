@@ -8,6 +8,8 @@ Before the run, GPU 0 had 12,726 MiB used and 11,516 MiB free. GPU 1 had 18,746 
 
 Eight tasks ran. Five passed. The three plain answer tasks passed. The chained addition then multiplication task passed and recorded two tool calls and observations. The two single tool tasks and the other chained task returned empty model output without a tool call. The malformed output task correctly detected and scored an empty response. This establishes that tool calling works, while Granite's behavior on these prompts is inconsistent.
 
+The isolated rerun script was then verified using an Ollama runtime copied under the same account and a 4,096 token context. Six of eight tasks passed. Both chained arithmetic tasks made two tool calls and passed. The two single tool tasks still returned empty output. The script stopped its own service after completion, and GPU 0 returned to 12,726 MiB used. This second run is saved as `results/smoke-20260928T135427.jsonl` with matching metrics.
+
 Complete request and response trajectories, observations, latency, token usage, errors, and scores are saved in `results/smoke.jsonl` on the server. Aggregate metrics are in `results/smoke.metrics.json`. The first run recorded 4,402 total tokens. Pass rate, pass@1, and avg@1 were each 0.625. Unit tests verified pass@2 and avg@2 on a two attempt fixture; all three tests passed.
 
 Rerun with:

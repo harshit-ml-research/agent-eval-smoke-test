@@ -18,7 +18,7 @@ if (( free_mib < 11000 )); then
 fi
 
 mkdir -p results
-OLLAMA_HOST="127.0.0.1:$port" OLLAMA_MODELS="$models" CUDA_VISIBLE_DEVICES=0 OLLAMA_MAX_LOADED_MODELS=1 \
+OLLAMA_HOST="127.0.0.1:$port" OLLAMA_MODELS="$models" CUDA_VISIBLE_DEVICES=0 OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_CONTEXT_LENGTH=4096 \
   "$runtime" serve > results/ollama.log 2>&1 &
 server_pid=$!
 trap 'kill "$server_pid" 2>/dev/null || true' EXIT
