@@ -10,6 +10,8 @@ class Task:
     allow_tools: bool = False
     min_tool_calls: int = 0
     expect_error: bool = False
+    category: str = ""
+    expected_calls: tuple[tuple[str, int, int], ...] = ()
 
 
 class BenchmarkAdapter(Protocol):

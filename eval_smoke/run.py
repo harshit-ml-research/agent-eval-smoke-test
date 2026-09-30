@@ -13,10 +13,19 @@ def main() -> None:
     parser.add_argument("--api-key", default="local")
     parser.add_argument("--output", type=Path, default=Path("results/smoke.jsonl"))
     parser.add_argument("--attempts", type=int, default=1)
+    parser.add_argument("--backend", choices=("openai", "param2"), default="openai")
+    parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--suite", choices=("smoke", "expanded"), default="smoke")
     args = parser.parse_args()
     if args.attempts < 1:
         parser.error("--attempts must be at least 1")
-    metrics = run_suite(OpenAICompatibleBackend(args.base_url, args.api_key), args.model, args.output, args.attempts)
+    if args.backend == "param2":
+        from eval_smoke.models.param2 import Param2TransformersBackend
+        backend = Param2TransformersBackend(args.model)
+    else:
+        backend = OpenAICompatibleBackend(args.base_url, args.api_key)
+    metrics = run_suite(backend, args.model, args.output, args.attempts, args.timeout, args.max_tokens, args.suite)
     print(json.dumps(metrics, indent=2))
 
 

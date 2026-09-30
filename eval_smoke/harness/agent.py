@@ -1,6 +1,6 @@
 import json
 import time
-from typing import Any
+from typing import Any, Callable
 
 from eval_smoke.models.backend import ModelBackend
 
@@ -15,6 +15,10 @@ def run_agent(
     allow_tools: bool,
     max_turns: int = 5,
     timeout: float = 120,
+    max_tokens: int = 256,
+    tools: list[dict[str, Any]] | None = None,
+    execute_tool: Callable[[str, str], dict[str, Any]] | None = None,
+    finalize_on_last_turn: bool = False,
 ) -> dict[str, Any]:
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -26,16 +30,21 @@ def run_agent(
     error = None
     status = "max_turns"
     answer = ""
+    available_tools = TOOLS if tools is None else tools
+    tool_executor = execute if execute_tool is None else execute_tool
     for turn in range(max_turns):
+        final_turn = finalize_on_last_turn and turn == max_turns - 1
+        if final_turn:
+            messages.append({"role": "user", "content": "Tool budget is exhausted. Return the required compact JSON diagnosis now using observed evidence. State uncertainty when needed."})
         remaining = timeout - (time.monotonic() - started)
         if remaining <= 0:
             status = "timeout"
             break
         request = {
             "messages": json.loads(json.dumps(messages)),
-            "tools": TOOLS if allow_tools else [],
+            "tools": available_tools if allow_tools and not final_turn else [],
             "temperature": 0,
-            "max_tokens": 256,
+            "max_tokens": max_tokens,
             "model": model,
             "timeout": remaining,
         }
@@ -61,12 +70,12 @@ def run_agent(
         messages.append(message)
         calls = message.get("tool_calls") or []
         if calls:
-            if not allow_tools:
+            if not allow_tools or final_turn:
                 status = "unexpected_tool_call"
                 break
             for call in calls:
                 function = call.get("function") or {}
-                observation = execute(function.get("name", ""), function.get("arguments", ""))
+                observation = tool_executor(function.get("name", ""), function.get("arguments", ""))
                 trajectory[-1]["observations"].append({"call": call, "result": observation})
                 messages.append({
                     "role": "tool",

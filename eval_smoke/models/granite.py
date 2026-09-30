@@ -9,8 +9,9 @@ from .backend import Generation
 
 
 class OpenAICompatibleBackend:
-    def __init__(self, base_url: str, api_key: str = "local") -> None:
+    def __init__(self, base_url: str, api_key: str = "local", reasoning_effort: str | None = None) -> None:
         self.client = OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+        self.reasoning_effort = reasoning_effort
 
     def generate(
         self,
@@ -30,6 +31,8 @@ class OpenAICompatibleBackend:
         }
         if tools:
             request["tools"] = tools
+        if self.reasoning_effort is not None:
+            request["reasoning_effort"] = self.reasoning_effort
         started = time.monotonic()
         response = self.client.chat.completions.create(**request)
         message = response.choices[0].message.model_dump(exclude_none=True)
