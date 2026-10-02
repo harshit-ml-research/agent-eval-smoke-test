@@ -1,6 +1,8 @@
-# Agent evaluation smoke test
+# Completed agent evaluation smoke tests
 
-Small, backend independent agent evaluation harness for validating a local model before integrating ITBench.
+Completed Granite and public Param2 smoke experiments. This directory preserves the existing harness, reports, tests, and raw results. Active internal SFT evaluation is in [param-base-eval](../param-base-eval/README.md).
+
+The local directory was renamed from `agent-eval-smoke-test` to `smoke`. The server reproduction commands below retain the original passpoli deployment paths. For local checks, run `python3 -m pytest -q tests` from this directory.
 
 ## Run
 
@@ -20,6 +22,12 @@ python -m eval_smoke.run --base-url http://127.0.0.1:11434/v1 --model granite4.2
 ```
 
 The Ollama endpoint is one option. Any OpenAI compatible endpoint, including vLLM, can be selected with `--base-url` and `--model`. Requests, responses, trajectories, errors, scores, and aggregate metrics are saved as JSONL or JSON files under `results/`.
+
+The harness distinguishes token-limit truncation, malformed protocol output and invalid final diagnoses from successful completion. Incomplete thinking/tool blocks are rejected. A truncated generation cannot execute tool calls. ITBench diagnoses must satisfy the requested entity naming, field types and output-size limits before they enter proxy scoring.
+
+The ITBench Lite adapter also requires `jsonschema` to validate tool arguments. Event filters use exact scalar equality; lists and wildcards are unsupported. When a snapshot has an `alerts/` directory, only that directory supplies alert evidence. Tool failures retain their raw response and are counted separately in metrics.
+
+Install the offline tool dependencies with `python -m pip install -r requirements-itbench.txt`. To include reference-tool regression tests, add the checked-out reference agent directory to `PYTHONPATH` before running pytest. Those integration tests are skipped when the reference tools or their dependencies are unavailable.
 
 See [SMOKE_REPORT.md](SMOKE_REPORT.md) for the first run.
 

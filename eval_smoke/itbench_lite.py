@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from jsonschema import Draft202012Validator
 
 from eval_smoke.harness.agent import run_agent
 from eval_smoke.logging.jsonl import append_jsonl
@@ -21,7 +22,7 @@ SYSTEM_PROMPT = (
     "Return only a JSON object with arrays named entities, propagations, and alerts_explained. "
     "Include at most three entities. Each entity needs name in namespace/Kind/name form, contributing_factor as a boolean, "
     "reasoning, and evidence. Each propagation needs source, target, condition, and effect. "
-    "Include at most three alert explanations. Each needs alert, explanation, and explained. Identify causes separately "
+    "Include at most three alert explanations. Each needs alert, explanation, and explained as a boolean. Identify causes separately "
     "from impacted entities and cite observed evidence in the JSON fields."
 )
 
@@ -33,11 +34,20 @@ def _tool(name: str, description: str, properties: dict[str, Any], required: lis
     }}
 
 
+EVENT_COLUMNS = ["namespace", "object_kind", "object_name", "reason", "message",
+                 "event_time", "event_kind", "watch_type", "count",
+                 "source_component", "log_timestamp", "deployment"]
+
 TOOLS = [
     _tool("alert_summary", "Summarize firing alerts, affected entities, and time ranges. Use first.", {}),
     _tool("event_analysis", "Analyze Kubernetes events. Valid columns include namespace, object_kind, object_name, reason, message, event_kind, and deployment. Use these names for filters and group_by.", {
-        "filters": {"type": "object"}, "group_by": {"type": "string"},
-        "agg": {"type": "string"}, "limit": {"type": "integer"},
+        "filters": {"type": "object", "description": "Exact equality filters. Each value must be a single scalar, never a list or wildcard.",
+                    "properties": {column: {"type": ["string", "number", "boolean"]} for column in EVENT_COLUMNS},
+                    "additionalProperties": False},
+        "group_by": {"oneOf": [{"type": "string", "enum": EVENT_COLUMNS},
+                                 {"type": "array", "items": {"type": "string", "enum": EVENT_COLUMNS}, "minItems": 1}]},
+        "agg": {"type": "string", "enum": ["count", "first", "last", "nunique", "list"]},
+        "limit": {"type": "integer", "minimum": 1},
     }),
     _tool("log_analysis", "Inspect application log patterns and errors.", {
         "service_name": {"type": "string"}, "severity_filter": {"type": "string"},
@@ -58,6 +68,18 @@ TOOLS = [
 
 
 def execute_snapshot_tool(snapshot: Path, name: str, raw_arguments: str) -> dict[str, Any]:
+    definition = next((tool["function"] for tool in TOOLS if tool["function"]["name"] == name), None)
+    if definition is None:
+        return {"ok": False, "error": f"Unknown tool: {name}", "error_type": "invalid_arguments"}
+    try:
+        arguments = json.loads(raw_arguments)
+        validator = Draft202012Validator(definition["parameters"])
+        errors = list(validator.iter_errors(arguments))
+        if errors:
+            detail = "; ".join(f"{'.'.join(map(str, error.path)) or 'arguments'}: {error.message}" for error in errors)
+            return {"ok": False, "error": detail, "error_type": "invalid_arguments"}
+    except (ValueError, TypeError) as exc:
+        return {"ok": False, "error": str(exc), "error_type": "invalid_arguments"}
     from sre_tools.offline_incident_analysis.alerts.analyzer import _alert_summary
     from sre_tools.offline_incident_analysis.events.analyzer import _event_analysis
     from sre_tools.offline_incident_analysis.k8s_specs.retriever import _get_k8_spec
@@ -66,7 +88,7 @@ def execute_snapshot_tool(snapshot: Path, name: str, raw_arguments: str) -> dict
     from sre_tools.offline_incident_analysis.traces.analyzer import _get_trace_error_tree
 
     handlers = {
-        "alert_summary": (_alert_summary, {"base_dir": str(snapshot), "limit": 30}),
+        "alert_summary": (_alert_summary, {"base_dir": str(snapshot / "alerts" if (snapshot / "alerts").is_dir() else snapshot), "limit": 30}),
         "event_analysis": (_event_analysis, {"events_file": str(snapshot / "k8s_events_raw.tsv"), "limit": 50}),
         "log_analysis": (_log_analysis, {"logs_file": str(snapshot / "otel_logs_raw.tsv"), "max_patterns": 20}),
         "metric_analysis": (_metric_analysis, {"base_dir": str(snapshot / "metrics"), "limit": 50}),
@@ -76,17 +98,31 @@ def execute_snapshot_tool(snapshot: Path, name: str, raw_arguments: str) -> dict
     if name not in handlers:
         return {"ok": False, "error": f"Unknown tool: {name}"}
     try:
-        arguments = json.loads(raw_arguments)
-        if not isinstance(arguments, dict):
-            raise ValueError("Tool arguments must be an object")
         handler, fixed = handlers[name]
         parts = asyncio.run(handler({**arguments, **fixed}))
         output = "\n".join(part.text for part in parts)
+        failures = []
+        for part in parts:
+            text = part.text.strip()
+            if text.lower().startswith(("error:", "error reading", "error in eval:",
+                                        "alerts directory not found:", "events file not found:",
+                                        "metrics directory not found:", "logs file not found:",
+                                        "trace file not found:", "no metric files found")):
+                failures.append(text)
+            else:
+                try:
+                    payload = json.loads(text)
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict) and payload.get("error"):
+                    failures.append(str(payload["error"]))
+        if failures:
+            return {"ok": False, "error": "\n".join(failures), "result": output, "error_type": "tool_error"}
         if len(output) > 16000:
             output = output[:16000] + "\n[tool output truncated]"
         return {"ok": True, "result": output}
     except Exception as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "error_type": "tool_error"}
 
 
 def root_cause_hit(diagnosis: dict[str, Any], ground_truth: dict[str, Any]) -> bool:
@@ -111,8 +147,34 @@ def root_cause_hit(diagnosis: dict[str, Any], ground_truth: dict[str, Any]) -> b
     return False
 
 
-def run_scenarios(backend: Any, model: str, snapshot_root: Path, output: Path, limit: int, max_tokens: int, max_turns: int, timeout: int) -> dict[str, Any]:
-    scenarios = sorted(snapshot_root.glob("Scenario-*"), key=lambda path: int(path.name.split("-")[-1]))[:limit]
+def parse_diagnosis(answer: str) -> dict[str, Any]:
+    """Validate the requested diagnosis contract, independently of correctness."""
+    diagnosis = json.loads(answer)
+    def fields(properties):
+        return {"type": "object", "properties": properties, "required": list(properties)}
+    string = {"type": "string", "minLength": 1}
+    entity = fields({"name": {"type": "string", "pattern": r"^[^/\s]+/[^/\s]+/[^/\s]+$"},
+                     "contributing_factor": {"type": "boolean"}, "reasoning": string,
+                     "evidence": {"anyOf": [string, {"type": "array", "minItems": 1, "items": string}]}})
+    propagation = fields({key: string for key in ("source", "target", "condition", "effect")})
+    alert = fields({"alert": string, "explanation": string, "explained": {"type": "boolean"}})
+    schema = fields({"entities": {"type": "array", "maxItems": 3, "items": entity},
+                     "propagations": {"type": "array", "items": propagation},
+                     "alerts_explained": {"type": "array", "maxItems": 3, "items": alert}})
+    errors = sorted(Draft202012Validator(schema).iter_errors(diagnosis), key=lambda e: str(list(e.path)))
+    if errors:
+        first = errors[0]
+        raise ValueError(f"Diagnosis {'.'.join(map(str, first.path)) or 'root'}: {first.message}")
+    return diagnosis
+
+
+def run_scenarios(backend: Any, model: str, snapshot_root: Path, output: Path, limit: int, max_tokens: int, max_turns: int, timeout: int, scenario_ids: list[int] | None = None) -> dict[str, Any]:
+    scenarios = sorted(snapshot_root.glob("Scenario-*"), key=lambda path: int(path.name.split("-")[-1]))
+    if scenario_ids is not None:
+        scenarios = [path for path in scenarios if int(path.name.split('-')[-1]) in scenario_ids]
+        if len(scenarios) != len(set(scenario_ids)):
+            raise ValueError("Requested scenarios are missing")
+    scenarios = scenarios[:limit]
     if len(scenarios) != limit:
         raise ValueError(f"Expected {limit} scenarios in {snapshot_root}, found {len(scenarios)}")
     records = []
@@ -122,11 +184,12 @@ def run_scenarios(backend: Any, model: str, snapshot_root: Path, output: Path, l
             SYSTEM_PROMPT, True, max_turns=max_turns, timeout=timeout, max_tokens=max_tokens,
             tools=TOOLS, execute_tool=lambda name, arguments: execute_snapshot_tool(snapshot, name, arguments),
             finalize_on_last_turn=True,
+            validate_answer=parse_diagnosis,
         )
         try:
-            diagnosis = json.loads(result["answer"])
-            if not isinstance(diagnosis, dict) or any(not isinstance(diagnosis.get(key), list) for key in ("entities", "propagations", "alerts_explained")):
-                raise ValueError("Missing diagnosis arrays")
+            if result['status'] != 'completed':
+                raise ValueError(result.get('error') or result['status'])
+            diagnosis = parse_diagnosis(result["answer"])
             parse_error = None
         except (json.JSONDecodeError, ValueError) as exc:
             diagnosis = None
@@ -145,6 +208,9 @@ def run_scenarios(backend: Any, model: str, snapshot_root: Path, output: Path, l
         "scenarios": len(records), "root_cause_hit_proxy": sum(row["root_cause_hit_proxy"] for row in records) / len(records),
         "valid_json": sum(row["parse_error"] is None for row in records),
         "tool_calls": sum(row["tool_calls"] for row in records),
+        "tool_errors": sum(not observation["result"].get("ok", False)
+                           for row in records for turn in row["trajectory"]
+                           for observation in turn.get("observations", [])),
     }
     output.with_suffix(".metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
     return metrics

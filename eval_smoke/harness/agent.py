@@ -19,6 +19,7 @@ def run_agent(
     tools: list[dict[str, Any]] | None = None,
     execute_tool: Callable[[str, str], dict[str, Any]] | None = None,
     finalize_on_last_turn: bool = False,
+    validate_answer: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -68,6 +69,14 @@ def run_agent(
         for key in totals:
             totals[key] += result.usage.get(key, 0) or 0
         messages.append(message)
+        if result.raw_response.get("finish_reason") == "length":
+            status = "truncated_output"
+            error = "Generation reached the output token limit"
+            break
+        if result.raw_response.get("parser_error"):
+            status = "malformed_output"
+            error = result.raw_response["parser_error"]
+            break
         calls = message.get("tool_calls") or []
         if calls:
             if not allow_tools or final_turn:
@@ -85,6 +94,12 @@ def run_agent(
             continue
         answer = message.get("content") or ""
         status = "completed" if answer.strip() else "malformed_output"
+        if status == "completed" and validate_answer is not None:
+            try:
+                validate_answer(answer)
+            except ValueError as exc:
+                status = "invalid_answer"
+                error = f"{type(exc).__name__}: {exc}"
         break
     return {
         "status": status,

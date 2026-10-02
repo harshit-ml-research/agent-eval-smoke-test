@@ -1,0 +1,5 @@
+jsonschema>=4.18
+PyYAML>=6
+pandas>=2,<4
+mcp>=1
+drain3==0.9.11
