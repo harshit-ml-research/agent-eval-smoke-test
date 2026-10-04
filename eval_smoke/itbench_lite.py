@@ -99,7 +99,9 @@ def execute_snapshot_tool(snapshot: Path, name: str, raw_arguments: str) -> dict
         return {"ok": False, "error": f"Unknown tool: {name}"}
     try:
         handler, fixed = handlers[name]
-        parts = asyncio.run(handler({**arguments, **fixed}))
+        output_controls = {key: value for key, value in fixed.items() if key in {"limit", "max_patterns"}}
+        snapshot_paths = {key: value for key, value in fixed.items() if key not in output_controls}
+        parts = asyncio.run(handler({**output_controls, **arguments, **snapshot_paths}))
         output = "\n".join(part.text for part in parts)
         failures = []
         for part in parts:
@@ -119,7 +121,8 @@ def execute_snapshot_tool(snapshot: Path, name: str, raw_arguments: str) -> dict
         if failures:
             return {"ok": False, "error": "\n".join(failures), "result": output, "error_type": "tool_error"}
         if len(output) > 16000:
-            output = output[:16000] + "\n[tool output truncated]"
+            return {"ok": True, "result": output[:16000] + "\n[tool output truncated]",
+                    "raw_result": output}
         return {"ok": True, "result": output}
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "error_type": "tool_error"}

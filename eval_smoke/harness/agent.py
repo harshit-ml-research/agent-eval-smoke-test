@@ -89,7 +89,8 @@ def run_agent(
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.get("id", "missing"),
-                    "content": json.dumps(observation),
+                    "content": json.dumps({key: value for key, value in observation.items()
+                                           if key != "raw_result"}),
                 })
             continue
         answer = message.get("content") or ""

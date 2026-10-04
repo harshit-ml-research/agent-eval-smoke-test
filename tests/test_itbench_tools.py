@@ -87,6 +87,88 @@ def test_valid_event_filters_reach_reference_tool(tmp_path, reference_tools):
         {'namespace': 'otel-demo', 'object_kind': 'Pod', 'count': 1}]
 
 
+@pytest.mark.parametrize('group_columns', [
+    ['namespace', 'reason'], ['namespace', 'message'], ['namespace', 'event_kind'],
+    ['reason', 'message', 'event_kind'], ['reason', 'message', 'event_kind', 'count'],
+])
+@pytest.mark.parametrize('empty', [False, True])
+def test_event_list_aggregation_does_not_duplicate_group_keys(tmp_path, reference_tools, group_columns, empty):
+    (tmp_path / 'k8s_events_raw.tsv').write_text(
+        'namespace\tobject_kind\tobject_name\treason\tmessage\tevent_kind\tcount\tevent_time\n'
+        'otel-demo\tPod\tcheckout-123\tBackOff\tConnection refused\tWarning\t1\t2025-12-15T17:30:00Z\n')
+    result = execute_snapshot_tool(tmp_path, 'event_analysis', json.dumps({
+        'filters': {'namespace': 'missing' if empty else 'otel-demo'},
+        'group_by': group_columns, 'agg': 'list'}))
+    assert result['ok'] is True, result
+    payload = json.loads(result['result'])
+    assert payload['returned_count'] == (0 if empty else 1)
+    if not empty:
+        for column in group_columns:
+            assert not isinstance(payload['data'][0][column], list)
+
+
+@pytest.mark.parametrize('name,module_name,handler_name,key,default', [
+    ('event_analysis', 'events', '_event_analysis', 'limit', 50),
+    ('log_analysis', 'logs', '_log_analysis', 'max_patterns', 20),
+    ('metric_analysis', 'metrics', '_metric_analysis', 'limit', 50),
+])
+def test_output_controls_honor_requests_and_retain_defaults(tmp_path, reference_tools, monkeypatch,
+                                                          name, module_name, handler_name, key, default):
+    import importlib
+    from mcp.types import TextContent
+
+    module = importlib.import_module(f'sre_tools.offline_incident_analysis.{module_name}.analyzer')
+    requests = []
+
+    async def capture(arguments):
+        requests.append(arguments)
+        return [TextContent(type='text', text='[]')]
+
+    monkeypatch.setattr(module, handler_name, capture)
+    assert execute_snapshot_tool(tmp_path, name, json.dumps({key: 1}))['ok'] is True
+    assert execute_snapshot_tool(tmp_path, name, '{}')['ok'] is True
+    assert [request[key] for request in requests] == [1, default]
+    protected_key = {'event_analysis': 'events_file', 'log_analysis': 'logs_file',
+                     'metric_analysis': 'base_dir'}[name]
+    rejected = execute_snapshot_tool(tmp_path, name, json.dumps({protected_key: '/outside'}))
+    assert rejected['error_type'] == 'invalid_arguments'
+    assert len(requests) == 2
+
+
+def test_full_evidence_is_saved_without_entering_model_context(tmp_path, reference_tools, monkeypatch):
+    from mcp.types import TextContent
+    from eval_smoke.harness.agent import run_agent
+    from sre_tools.offline_incident_analysis.events import analyzer
+
+    full_output = json.dumps({'data': [{'message': 'x' * 17000}]})
+
+    async def response(arguments):
+        return [TextContent(type='text', text=full_output)]
+
+    monkeypatch.setattr(analyzer, '_event_analysis', response)
+    requests = []
+
+    class Backend:
+        def generate(self, **kwargs):
+            requests.append(kwargs)
+            if len(requests) == 1:
+                message = {'role': 'assistant', 'tool_calls': [{'id': 'call_1',
+                           'function': {'name': 'event_analysis', 'arguments': '{}'}}]}
+            else:
+                message = {'role': 'assistant', 'content': 'done'}
+            return Generation(message, 0.01)
+
+    result = run_agent(Backend(), 'test', 'investigate', 'system', True, max_turns=2,
+                       tools=TOOLS, execute_tool=lambda name, arguments: execute_snapshot_tool(tmp_path, name, arguments))
+    saved = result['trajectory'][0]['observations'][0]['result']
+    model_visible = json.loads(requests[1]['messages'][-1]['content'])
+    assert saved['raw_result'] == full_output
+    assert saved['result'].endswith('[tool output truncated]')
+    assert 'raw_result' not in model_visible
+    assert model_visible == {key: value for key, value in saved.items() if key != 'raw_result'}
+    assert full_output not in requests[1]['messages'][-1]['content']
+
+
 @pytest.mark.parametrize('response', [
     'Error: Group column entity not found',
     'Error reading events file: missing',
